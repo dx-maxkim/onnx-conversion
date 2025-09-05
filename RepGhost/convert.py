@@ -5,21 +5,18 @@ import onnx
 from onnxsim import simplify
 
 
-# ILSVRC 2012, 1,000 클래스
+# in1k: ILSVRC 2012, 1,000 클래스
 MODELS = [
-    "tf_efficientnetv2_s.in1k", # https://huggingface.co/timm/tf_efficientnetv2_s.in1k
-    "tf_efficientnetv2_m.in1k", # https://huggingface.co/timm/tf_efficientnetv2_m.in1k
-    "tf_efficientnetv2_l.in1k", # https://huggingface.co/timm/tf_efficientnetv2_l.in1k
+    "repghostnet_100.in1k", # https://huggingface.co/timm/repghostnet_100.in1k
+    "repghostnet_200.in1k", # https://huggingface.co/timm/repghostnet_200.in1k
 ]
 
-# timm default_cfg 기반 입력 크기
-# Ref: https://github.com/NVlabs/A-ViT/blob/master/timm/models/efficientnet.py -> default_cfg
 IM_SIZE = {
-    "tf_efficientnetv2_s.in1k": 300,
-    "tf_efficientnetv2_m.in1k": 384,
-    "tf_efficientnetv2_l.in1k": 384,
+    "repghostnet_100.in1k": 224,
+    "repghostnet_200.in1k": 224,
 }
 
+# Output path
 os.makedirs("onnx_out", exist_ok=True)
 
 def export_one(model_name: str, opset: int = 13):
@@ -32,8 +29,6 @@ def export_one(model_name: str, opset: int = 13):
 
     # 파일 이름 변환 (tf_, .in1k 제거)
     base_name = model_name
-    if base_name.startswith("tf_"):
-        base_name = base_name[3:]
     if base_name.endswith(".in1k"):
         base_name = base_name[:-5]
 
