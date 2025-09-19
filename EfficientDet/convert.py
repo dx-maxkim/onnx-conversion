@@ -9,6 +9,7 @@ import requests
 import onnx
 import numpy as np
 import onnxruntime as ort
+import tensorflow as tf # <--- 입력 이름 확인을 위해 추가
 
 # =========================
 # User-config (하드코딩)
@@ -45,13 +46,28 @@ def download_tflite(url: str, out_path: Path) -> Path:
     print(f"[+] Saved: {out_path}")
     return out_path
 
-def run_tf2onnx_tflite_to_onnx(tflite_path: Path, onnx_path: Path, opset: int = 13) -> Path:
+# +++ 신규 함수: TFLite 모델의 입력 텐서 이름을 가져옵니다. +++
+def get_tflite_input_name(tflite_path: Path) -> str:
+    """Uses TensorFlow Lite interpreter to get the name of the first input tensor."""
+    interpreter = tf.lite.Interpreter(model_path=str(tflite_path))
+    interpreter.allocate_tensors()
+    input_details = interpreter.get_input_details()
+    if not input_details:
+        raise ValueError("Could not get input details from TFLite model.")
+    input_name = input_details[0]['name']
+    print(f"[i] Found TFLite input tensor name: {input_name}")
+    return input_name
+
+# *** 수정된 함수: NCHW 변환 옵션을 추가합니다. ***
+def run_tf2onnx_tflite_to_onnx(tflite_path: Path, onnx_path: Path, tflite_input_name: str, opset: int = 13) -> Path:
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable, "-m", "tf2onnx.convert",
         "--tflite", str(tflite_path),
         "--output", str(onnx_path),
         "--opset", str(opset),
+        # <--- NCHW 변환을 위한 핵심 옵션 ---
+        "--inputs-as-nchw", tflite_input_name,
     ]
     print("[i] Running:", " ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -68,8 +84,20 @@ def simplify_onnx(onnx_path: Path) -> Path:
         return onnx_path
 
     print("[i] Simplifying ONNX with onnx-simplifier...")
+    # NCHW 입력을 위한 shape 명시
+    input_shapes = {"image": [1, 3, 320, 320]} # efficientdet은 보통 'image'를 입력 이름으로 가집니다.
     m = onnx.load(str(onnx_path))
-    sm, ok = simplify(m, check_n=3, perform_optimization=True)
+    # simplify 실행 시 동적 입력을 고정 shape으로 지정해주면 더 안정적입니다.
+    # 모델의 실제 입력 이름을 모를 경우 이 부분은 생략해도 동작할 수 있습니다.
+    try:
+        input_name = m.graph.input[0].name
+        input_shapes = {input_name: [1, 3, 320, 320]}
+        print(f"[i] Using input shape for simplifier: {input_shapes}")
+        sm, ok = simplify(m, overwrite_input_shapes=input_shapes, check_n=3, perform_optimization=True)
+    except Exception:
+        print("[w] Failed to simplify with explicit shape, trying without it.")
+        sm, ok = simplify(m, check_n=3, perform_optimization=True)
+
     if not ok:
         print("[!] Simplify check failed; keep original.")
         return onnx_path
@@ -79,10 +107,6 @@ def simplify_onnx(onnx_path: Path) -> Path:
     return out
 
 def fix_batch_dim_to_1(onnx_path: Path) -> Path:
-    """
-    모든 입력/출력 텐서의 첫 번째 축을 1로 고정합니다(랭크>=1인 경우).
-    모델 전반 shape-consistency를 위해 shape inference를 한 번 더 수행합니다.
-    """
     if not FIX_BATCH_TO_1:
         return onnx_path
 
@@ -93,29 +117,20 @@ def fix_batch_dim_to_1(onnx_path: Path) -> Path:
         tt = v.type.tensor_type
         if tt.HasField("shape") and len(tt.shape.dim) >= 1:
             d0 = tt.shape.dim[0]
-            # dim_param or dim_value 어떤 것이든 1로 고정
             d0.dim_param = ""
             d0.dim_value = 1
 
-    # graph inputs/outputs
-    for v in model.graph.input:
-        set_first_dim_to_1(v)
-    for v in model.graph.output:
-        set_first_dim_to_1(v)
-
-    # value_info (중간 텐서 정보가 있다면 같이 고정)
-    for v in model.graph.value_info:
-        set_first_dim_to_1(v)
+    for v in model.graph.input: set_first_dim_to_1(v)
+    for v in model.graph.output: set_first_dim_to_1(v)
+    for v in model.graph.value_info: set_first_dim_to_1(v)
 
     tmp_out = onnx_path.with_name(onnx_path.stem + "_bs1.onnx")
     onnx.save(model, str(tmp_out))
     print(f"[+] Batch=1 fixed ONNX saved: {tmp_out}")
 
-    # shape inference (선택적이지만 권장)
     try:
         from onnx import shape_inference
         inf = shape_inference.infer_shapes_path(str(tmp_out))
-        # infer_shapes_path가 파일을 덮어쓰는 구현이 아닌 경우 대비
         if isinstance(inf, onnx.ModelProto):
             onnx.save(inf, str(tmp_out))
     except Exception as e:
@@ -129,15 +144,7 @@ def inspect_model(onnx_path: Path):
     def io_list(vs):
         out = []
         for v in vs:
-            shp = []
-            if v.type.tensor_type.shape.dim:
-                for d in v.type.tensor_type.shape.dim:
-                    if d.dim_value != 0:
-                        shp.append(d.dim_value)
-                    elif d.dim_param:
-                        shp.append(d.dim_param)
-                    else:
-                        shp.append("?")
+            shp = [d.dim_value if d.dim_value > 0 else d.dim_param or "?" for d in v.type.tensor_type.shape.dim]
             out.append({"name": v.name, "shape": shp})
         return out
     info = {"inputs": io_list(g.input), "outputs": io_list(g.output), "nodes": len(g.node)}
@@ -152,14 +159,8 @@ def quick_infer(onnx_path: Path):
     sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     feeds = {}
     for i in sess.get_inputs():
-        shape = []
-        for d in i.shape:
-            if isinstance(d, int) and d > 0:
-                shape.append(d)
-            else:
-                # 동적/미지정 -> 1로 대체
-                shape.append(1)
-        # 일반적으로 NHWC(1,H,W,3) 또는 NCHW(1,3,H,W)일 수 있음
+        shape = [d if isinstance(d, int) and d > 0 else 1 for d in i.shape]
+        # NCHW 포맷에 맞는 더미 데이터 생성
         arr = np.random.rand(*shape).astype(np.float32)
         feeds[i.name] = arr
     outs = sess.run(None, feeds)
@@ -180,8 +181,12 @@ def convert_one(name: str, url: str):
     # 1) Download
     download_tflite(url, tflite_path)
 
-    # 2) Convert (TFLite -> ONNX)
-    onnx_path = run_tf2onnx_tflite_to_onnx(tflite_path, onnx_path, opset=OPSET)
+    # *** 1.5) Get TFLite input tensor name ***
+    tflite_input_name = get_tflite_input_name(tflite_path)
+
+    # 2) Convert (TFLite -> ONNX with NCHW input)
+    # *** 입력 이름을 인자로 전달 ***
+    onnx_path = run_tf2onnx_tflite_to_onnx(tflite_path, onnx_path, tflite_input_name, opset=OPSET)
 
     # 3) Simplify
     onnx_path = simplify_onnx(onnx_path)
@@ -194,10 +199,18 @@ def convert_one(name: str, url: str):
     quick_infer(onnx_path)
 
 def main():
+    # 필요한 라이브러리 설치 확인
+    try:
+        import tf2onnx
+        import onnxsim
+    except ImportError as e:
+        print(f"[!] Missing required library: {e.name}")
+        print("Please run: pip install tensorflow tf2onnx onnxsim onnxruntime")
+        sys.exit(1)
+
     for name, url in MODELS.items():
         convert_one(name, url)
     print("\n[✓] All done!")
 
 if __name__ == "__main__":
     main()
-
